@@ -7,3 +7,4 @@ target
 e2e/results/*
 *.iml
 .java-version
+.vscode
