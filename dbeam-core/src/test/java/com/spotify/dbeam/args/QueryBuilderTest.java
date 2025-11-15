@@ -210,6 +210,34 @@ public class QueryBuilderTest {
     Assert.assertEquals(expected, actual);
   }
 
+
+  @Test
+  public void testTableNameWithExcludedColumnsShouldStillUseSelectStar() {
+    final com.google.common.collect.ImmutableSet<String> excludedColumns =
+        com.google.common.collect.ImmutableSet.of("col1");
+    final QueryBuilder wrapper =
+        QueryBuilder.fromTablename("some_table")
+            .withExcludedColumns(java.util.Optional.of(excludedColumns));
+
+    final String expected = "SELECT * FROM some_table WHERE 1=1";
+
+    Assert.assertEquals(expected, wrapper.build());
+  }
+
+  @Test
+  public void testRawSqlWithExcludedColumnShouldRemoveColumns() {
+    final com.google.common.collect.ImmutableSet<String> excludedColumns =
+        com.google.common.collect.ImmutableSet.of("col1");
+    final QueryBuilder wrapper =
+        QueryBuilder.fromSqlQuery("SELECT col1, col2 FROM some_table")
+            .withExcludedColumns(java.util.Optional.of(excludedColumns));
+
+    final String expected = 
+        "SELECT * FROM (SELECT col2 FROM some_table) as user_sql_query WHERE 1=1";
+
+    Assert.assertEquals(expected, wrapper.build());
+  }
+
   private void execAndCompare(String rawInput, String expected) {
     final String actual = QueryBuilder.fromSqlQuery(rawInput).build();
 

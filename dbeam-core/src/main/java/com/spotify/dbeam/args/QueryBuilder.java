@@ -21,6 +21,7 @@
 package com.spotify.dbeam.args;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Optional;
@@ -117,18 +118,24 @@ class QueryBuilder implements Serializable {
   private final QueryBase base;
   private final List<String> whereConditions;
   private final Optional<String> limitStr;
+  private final Optional<ImmutableSet<String>> excludedColumns;
 
   private QueryBuilder(final QueryBase base) {
     this.base = base;
     this.limitStr = Optional.empty();
     this.whereConditions = ImmutableList.of();
+    this.excludedColumns = Optional.empty();
   }
 
   private QueryBuilder(
-      final QueryBase base, final List<String> whereConditions, final Optional<String> limitStr) {
+      final QueryBase base,
+      final List<String> whereConditions,
+      final Optional<String> limitStr,
+      final Optional<ImmutableSet<String>> excludedColumns) {
     this.base = base;
     this.whereConditions = whereConditions;
     this.limitStr = limitStr;
+    this.excludedColumns = excludedColumns;
   }
 
   public static QueryBuilder fromTablename(final String tableName) {
@@ -148,7 +155,22 @@ class QueryBuilder implements Serializable {
                 Stream.of(
                     createSqlPartitionCondition(partitionColumn, startPointIncl, endPointExcl)))
             .collect(Collectors.toList()),
-        this.limitStr);
+        this.limitStr,
+        this.excludedColumns);
+  }
+
+  public QueryBuilder withExcludedColumns(final Optional<ImmutableSet<String>> excludedColumns) {
+    if (excludedColumns.isPresent() && this.base instanceof UserQueryBase) {
+      UserQueryBase userQueryBase = (UserQueryBase) this.base;
+      String newSqlQuery = rebuildSelectClause(userQueryBase.userSqlQuery, excludedColumns.get());
+      return new QueryBuilder(
+          new UserQueryBase(newSqlQuery, userQueryBase.selectClause),
+          this.whereConditions,
+          this.limitStr,
+          excludedColumns);
+    } else {
+      return new QueryBuilder(this.base, this.whereConditions, this.limitStr, excludedColumns);
+    }
   }
 
   private static String createSqlPartitionCondition(
@@ -171,7 +193,8 @@ class QueryBuilder implements Serializable {
                     createSqlSplitCondition(
                         partitionColumn, startPointIncl, endPoint, isEndPointExcl)))
             .collect(Collectors.toList()),
-        this.limitStr);
+        this.limitStr,
+        this.excludedColumns);
   }
 
   private static String createSqlSplitCondition(
@@ -205,9 +228,38 @@ class QueryBuilder implements Serializable {
     return sqlQuery.replaceAll(regex, "$1");
   }
 
+  private static String rebuildSelectClause(
+      String sqlQuery, ImmutableSet<String> excludedColumns) {
+    String lowerCaseQuery = sqlQuery.toLowerCase();
+    int selectIdx = lowerCaseQuery.indexOf("select");
+    int fromIdx = lowerCaseQuery.indexOf("from");
+
+    if (selectIdx == -1 || fromIdx == -1 || selectIdx > fromIdx) {
+      // Cannot parse, return original query
+      return sqlQuery;
+    }
+
+    String selectClause = sqlQuery.substring(selectIdx + "select".length(), fromIdx).trim();
+    String[] columns = selectClause.split(",");
+    List<String> newColumns =
+        Stream.of(columns)
+            .map(String::trim)
+            .filter(column -> !excludedColumns.contains(column))
+            .collect(Collectors.toList());
+
+    if (newColumns.isEmpty()) {
+      return "SELECT * " + sqlQuery.substring(fromIdx);
+    } else {
+      return "SELECT " + String.join(", ", newColumns) + " " + sqlQuery.substring(fromIdx);
+    }
+  }
+
   public QueryBuilder withLimit(long limit) {
     return new QueryBuilder(
-        this.base, this.whereConditions, Optional.of(String.format(" LIMIT %d", limit)));
+        this.base,
+        this.whereConditions,
+        Optional.of(String.format(" LIMIT %d", limit)),
+        this.excludedColumns);
   }
 
   @Override
@@ -248,6 +300,11 @@ class QueryBuilder implements Serializable {
             "SELECT MIN(%s) as %s, MAX(%s) as %s",
             splitColumn, minSplitColumnName, splitColumn, maxSplitColumnName);
 
-    return new QueryBuilder(base.withSelect(selectMinMax), this.whereConditions, this.limitStr);
+    return new QueryBuilder(
+        base.withSelect(selectMinMax),
+        this.whereConditions,
+        this.limitStr,
+        this.excludedColumns);
   }
 }
+
