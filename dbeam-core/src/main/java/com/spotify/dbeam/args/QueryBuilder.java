@@ -23,6 +23,12 @@ package com.spotify.dbeam.args;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import java.io.Serializable;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -119,23 +125,27 @@ class QueryBuilder implements Serializable {
   private final List<String> whereConditions;
   private final Optional<String> limitStr;
   private final Optional<ImmutableSet<String>> excludedColumns;
+  private final Optional<String> splitColumn;
 
   private QueryBuilder(final QueryBase base) {
     this.base = base;
     this.limitStr = Optional.empty();
     this.whereConditions = ImmutableList.of();
     this.excludedColumns = Optional.empty();
+    this.splitColumn = Optional.empty();
   }
 
   private QueryBuilder(
       final QueryBase base,
       final List<String> whereConditions,
       final Optional<String> limitStr,
-      final Optional<ImmutableSet<String>> excludedColumns) {
+      final Optional<ImmutableSet<String>> excludedColumns,
+      final Optional<String> splitColumn) {
     this.base = base;
     this.whereConditions = whereConditions;
     this.limitStr = limitStr;
     this.excludedColumns = excludedColumns;
+    this.splitColumn = splitColumn;
   }
 
   public static QueryBuilder fromTablename(final String tableName) {
@@ -151,25 +161,34 @@ class QueryBuilder implements Serializable {
     return new QueryBuilder(
         this.base,
         Stream.concat(
-                this.whereConditions.stream(),
-                Stream.of(
-                    createSqlPartitionCondition(partitionColumn, startPointIncl, endPointExcl)))
+            this.whereConditions.stream(),
+            Stream.of(
+                createSqlPartitionCondition(partitionColumn, startPointIncl, endPointExcl)))
             .collect(Collectors.toList()),
         this.limitStr,
-        this.excludedColumns);
+        this.excludedColumns,
+        this.splitColumn);
+  }
+
+  public QueryBuilder withSplitColumn(final Optional<String> splitColumn) {
+    return new QueryBuilder(
+        this.base, this.whereConditions, this.limitStr, this.excludedColumns, splitColumn);
   }
 
   public QueryBuilder withExcludedColumns(final Optional<ImmutableSet<String>> excludedColumns) {
     if (excludedColumns.isPresent() && this.base instanceof UserQueryBase) {
       UserQueryBase userQueryBase = (UserQueryBase) this.base;
-      String newSqlQuery = rebuildSelectClause(userQueryBase.userSqlQuery, excludedColumns.get());
+      String newSqlQuery =
+          rebuildSelectClause(userQueryBase.userSqlQuery, excludedColumns.get(), this.splitColumn);
       return new QueryBuilder(
           new UserQueryBase(newSqlQuery, userQueryBase.selectClause),
           this.whereConditions,
           this.limitStr,
-          excludedColumns);
+          excludedColumns,
+          this.splitColumn);
     } else {
-      return new QueryBuilder(this.base, this.whereConditions, this.limitStr, excludedColumns);
+      return new QueryBuilder(
+          this.base, this.whereConditions, this.limitStr, excludedColumns, this.splitColumn);
     }
   }
 
@@ -188,13 +207,14 @@ class QueryBuilder implements Serializable {
     return new QueryBuilder(
         this.base,
         Stream.concat(
-                this.whereConditions.stream(),
-                Stream.of(
-                    createSqlSplitCondition(
-                        partitionColumn, startPointIncl, endPoint, isEndPointExcl)))
+            this.whereConditions.stream(),
+            Stream.of(
+                createSqlSplitCondition(
+                    partitionColumn, startPointIncl, endPoint, isEndPointExcl)))
             .collect(Collectors.toList()),
         this.limitStr,
-        this.excludedColumns);
+        this.excludedColumns,
+        this.splitColumn);
   }
 
   private static String createSqlSplitCondition(
@@ -229,7 +249,7 @@ class QueryBuilder implements Serializable {
   }
 
   private static String rebuildSelectClause(
-      String sqlQuery, ImmutableSet<String> excludedColumns) {
+      String sqlQuery, ImmutableSet<String> excludedColumns, Optional<String> splitColumn) {
     String lowerCaseQuery = sqlQuery.toLowerCase();
     int selectIdx = lowerCaseQuery.indexOf("select");
     int fromIdx = lowerCaseQuery.indexOf("from");
@@ -244,8 +264,21 @@ class QueryBuilder implements Serializable {
     List<String> newColumns =
         Stream.of(columns)
             .map(String::trim)
-            .filter(column -> !excludedColumns.contains(column))
+            .filter(
+                column -> {
+                  if (splitColumn.isPresent() && column.equals(splitColumn.get())) {
+                    return true;
+                  }
+                  return !excludedColumns.contains(column);
+                })
             .collect(Collectors.toList());
+
+    if (splitColumn.isPresent()) {
+      boolean exists = newColumns.stream().anyMatch(c -> c.equals(splitColumn.get()));
+      if (!exists) {
+        newColumns.add(splitColumn.get());
+      }
+    }
 
     if (newColumns.isEmpty()) {
       return "SELECT * " + sqlQuery.substring(fromIdx);
@@ -259,7 +292,8 @@ class QueryBuilder implements Serializable {
         this.base,
         this.whereConditions,
         Optional.of(String.format(" LIMIT %d", limit)),
-        this.excludedColumns);
+        this.excludedColumns,
+        this.splitColumn);
   }
 
   @Override
@@ -284,6 +318,50 @@ class QueryBuilder implements Serializable {
     return base.hashCode();
   }
 
+  public QueryBuilder resolveSelect(final Connection connection) throws SQLException {
+    if (this.excludedColumns.isPresent()) {
+      String queryToCheck = this.base.getBaseSql() + " AND 1=0";
+      List<String> columns = getColumnsFromQuery(connection, queryToCheck);
+      List<String> filteredColumns =
+          columns.stream()
+              .filter(c -> !this.excludedColumns.get().contains(c))
+              .collect(Collectors.toList());
+
+      if (filteredColumns.isEmpty()) {
+        throw new SQLException("All columns excluded for query: " + queryToCheck);
+      }
+
+      String selectClause = "SELECT " + String.join(", ", filteredColumns);
+      return new QueryBuilder(
+          this.base.withSelect(selectClause),
+          this.whereConditions,
+          this.limitStr,
+          this.excludedColumns,
+          this.splitColumn);
+    }
+    return this;
+  }
+
+  private List<String> getColumnsFromQuery(Connection connection, String query)
+      throws SQLException {
+    List<String> columns = new ArrayList<>();
+    try (Statement st = connection.createStatement()) {
+      try (ResultSet rs = st.executeQuery(query)) {
+        ResultSetMetaData meta = rs.getMetaData();
+        for (int i = 1; i <= meta.getColumnCount(); i++) {
+          final String columnName;
+          if (meta.getColumnName(i).isEmpty()) {
+            columnName = meta.getColumnLabel(i);
+          } else {
+            columnName = meta.getColumnName(i);
+          }
+          columns.add(columnName);
+        }
+      }
+    }
+    return columns;
+  }
+
   /**
    * Generates a new query to get MIN/MAX values for splitColumn.
    *
@@ -304,7 +382,7 @@ class QueryBuilder implements Serializable {
         base.withSelect(selectMinMax),
         this.whereConditions,
         this.limitStr,
-        this.excludedColumns);
+        this.excludedColumns,
+        this.splitColumn);
   }
 }
-

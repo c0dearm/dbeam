@@ -127,8 +127,12 @@ public abstract class QueryBuilderArgs implements Serializable {
    */
   public List<String> buildQueries(final Connection connection) throws SQLException {
     QueryBuilder queryBuilder = this.baseSqlQuery();
+    if (this.splitColumn().isPresent()) {
+      queryBuilder = queryBuilder.withSplitColumn(this.splitColumn());
+    }
     if (this.excludedColumns().isPresent()) {
       queryBuilder = queryBuilder.withExcludedColumns(this.excludedColumns());
+      queryBuilder = queryBuilder.resolveSelect(connection);
     }
     if (this.partitionColumn().isPresent() && this.partition().isPresent()) {
       queryBuilder =
