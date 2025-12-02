@@ -171,7 +171,7 @@ public class JdbcAvroSchema {
         columnName = meta.getColumnName(i);
       }
 
-      if (excludedColumns.contains(columnName)) {
+      if (excludedColumns.stream().anyMatch(columnName::equalsIgnoreCase)) {
         continue;
       }
       

@@ -260,21 +260,21 @@ class QueryBuilder implements Serializable {
     }
 
     String selectClause = sqlQuery.substring(selectIdx + "select".length(), fromIdx).trim();
-    String[] columns = selectClause.split(",");
+    List<String> columns = splitColumns(selectClause);
     List<String> newColumns =
-        Stream.of(columns)
+        columns.stream()
             .map(String::trim)
             .filter(
                 column -> {
-                  if (splitColumn.isPresent() && column.equals(splitColumn.get())) {
+                  if (splitColumn.isPresent() && isColumn(column, splitColumn.get())) {
                     return true;
                   }
-                  return !excludedColumns.contains(column);
+                  return excludedColumns.stream().noneMatch(excluded -> isColumn(column, excluded));
                 })
             .collect(Collectors.toList());
 
     if (splitColumn.isPresent()) {
-      boolean exists = newColumns.stream().anyMatch(c -> c.equals(splitColumn.get()));
+      boolean exists = newColumns.stream().anyMatch(c -> isColumn(c, splitColumn.get()));
       if (!exists) {
         newColumns.add(splitColumn.get());
       }
@@ -285,6 +285,39 @@ class QueryBuilder implements Serializable {
     } else {
       return "SELECT " + String.join(", ", newColumns) + " " + sqlQuery.substring(fromIdx);
     }
+  }
+
+  private static List<String> splitColumns(String selectClause) {
+    List<String> columns = new ArrayList<>();
+    int parenDepth = 0;
+    int start = 0;
+    boolean inQuote = false;
+    for (int i = 0; i < selectClause.length(); i++) {
+      char c = selectClause.charAt(i);
+      if (c == '\'' && (i == 0 || selectClause.charAt(i - 1) != '\\')) {
+        inQuote = !inQuote;
+      } else if (!inQuote) {
+        if (c == '(') {
+          parenDepth++;
+        } else if (c == ')') {
+          parenDepth--;
+        } else if (c == ',' && parenDepth == 0) {
+          columns.add(selectClause.substring(start, i));
+          start = i + 1;
+        }
+      }
+    }
+    columns.add(selectClause.substring(start));
+    return columns;
+  }
+
+  private static boolean isColumn(String columnDefinition, String columnName) {
+    String trimmed = columnDefinition.trim();
+    if (trimmed.equalsIgnoreCase(columnName)) {
+      return true;
+    }
+    // Check for alias
+    return trimmed.matches("(?i).*\\s+(AS\\s+)?\\Q" + columnName + "\\E$");
   }
 
   public QueryBuilder withLimit(long limit) {
@@ -324,7 +357,8 @@ class QueryBuilder implements Serializable {
       List<String> columns = getColumnsFromQuery(connection, queryToCheck);
       List<String> filteredColumns =
           columns.stream()
-              .filter(c -> !this.excludedColumns.get().contains(c))
+              .filter(c -> this.excludedColumns.get().stream()
+                  .noneMatch(excluded -> excluded.equalsIgnoreCase(c)))
               .collect(Collectors.toList());
 
       if (filteredColumns.isEmpty()) {
